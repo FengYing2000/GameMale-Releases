@@ -1,0 +1,116 @@
+name: 建置安裝檔
+run-name: 建置 ${{ inputs.ref }}
+
+# 原始碼在私人庫 GameMale-APP；這個公開庫只負責編譯與發佈。
+# 公開庫的 GitHub Actions 不計分鐘數（私人庫的 macOS 算 10 倍，額度撐不了幾版）。
+# 原始碼用唯讀的部署金鑰（secrets.SOURCE_DEPLOY_KEY）拉下來，只存在建置機上，
+# 不會進到這個庫；紀錄檔也只印建置過程。
+#
+# 由原始碼庫的 tool/publish_release.py 觸發：
+#   gh workflow run build.yml -R FengYing2000/GameMale-Releases -f ref=v1.31.0
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 原始碼的標籤（例如 v1.31.0）
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ inputs.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: 3.47.1
+
+jobs:
+  ios:
+    # 一定要 macos-26（Xcode 26 + iOS 26 SDK）：有套件用到 iOS 26 才有的 API，
+    # 編譯期沒有該 SDK 就過不了
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: FengYing2000/GameMale-APP
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: 安裝相依套件
+        run: flutter pub get
+
+      - name: 靜態分析與測試
+        run: |
+          flutter analyze
+          flutter test --reporter=failures-only
+
+      - name: 建置未簽名 IPA（混淆）
+        # 混淆：函式與類別名稱換成亂碼，拆開安裝檔也很難看懂。
+        # 對照表（split-debug-info）只留在建置機，不上傳——這是公開庫，上傳等於公開
+        run: |
+          flutter build ios --release --no-codesign --obfuscate --split-debug-info=build/symbols
+          APP="build/ios/iphoneos/Runner.app"
+          test -d "$APP" || { echo "找不到 Runner.app"; exit 1; }
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          # 只清 app 層簽章；framework 層的是預簽的正常狀態，側載工具會自己重簽
+          rm -rf Payload/Runner.app/_CodeSignature
+          zip -qry GameMale.ipa Payload
+          ls -lh GameMale.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GameMale-unsigned-ipa
+          path: GameMale.ipa
+          retention-days: 7
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: FengYing2000/GameMale-APP
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: 安裝相依套件
+        run: flutter pub get
+
+      - name: 建置 APK（混淆）
+        # 分析與測試在 iOS 那邊跑過一次就好。用 Flutter 自動產的 debug 金鑰簽章，側載裝得起來
+        run: |
+          flutter build apk --release --obfuscate --split-debug-info=build/symbols
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+          test -f "$APK" || { echo "找不到 APK"; exit 1; }
+          cp "$APK" GameMale.apk
+          ls -lh GameMale.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GameMale-apk
+          path: GameMale.apk
+          retention-days: 7
+          if-no-files-found: error
